@@ -4,7 +4,8 @@ import yt_dlp
 import asyncio
 import os
 import uuid
-
+from dotenv import load_dotenv
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 os.makedirs("temp", exist_ok=True)
