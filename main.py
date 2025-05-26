@@ -3,117 +3,106 @@ from discord.ext import commands
 import yt_dlp
 import asyncio
 import os
-import uuid
-from dotenv import load_dotenv
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+import shutil
 
-os.makedirs("temp", exist_ok=True)
+TOKEN = os.getenv("DISCORD_TOKEN")  # Utilise une variable d'environnement (⚠️ plus sûr que hardcodé)
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.voice_states = True  # Nécessaire pour détecter les déconnexions vocales
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.voice_states = True
 
-ffmpeg_options = {'options': '-vn'}
-ytdl_format_options = {
-    'format': 'bestaudio',
-    'noplaylist': True,
-    'quiet': True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+if not os.path.exists("temp"):
+    os.makedirs("temp")
+
+ytdl_opts = {
+    'format': 'bestaudio/best',
+    'outtmpl': 'temp/%(id)s.%(ext)s',
+    'cookiefile': 'cookies.txt',  # <- Utilisation du fichier cookies
+    'quiet': True,
+    'no_warnings': True,
 }
-ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+ytdl = yt_dlp.YoutubeDL(ytdl_opts)
+
 
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, filepath, volume=0.5):
         super().__init__(source, volume)
         self.data = data
-        self.title = data.get("title")
         self.filepath = filepath
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
-        loop = loop or asyncio.get_event_loop()
+    async def from_url(cls, url, *, loop, stream=False):
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-        if "entries" in data:
-            data = data["entries"][0]
+        if 'entries' in data:
+            data = data['entries'][0]
+        filename = ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename), data=data, filepath=filename)
 
-        if stream:
-            filename = data["url"]
-        else:
-            downloaded_filename = ytdl.prepare_filename(data)
-            temp_filename = f"temp/{uuid.uuid4().hex}.mp3"
-            os.rename(downloaded_filename, temp_filename)
-            filename = temp_filename
 
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data, filepath=filename)
+@bot.event
+async def on_ready():
+    print(f'Connecté en tant que {bot.user}')
 
-async def cleanup_temp_folder():
-    for f in os.listdir("temp"):
-        path = os.path.join("temp", f)
-        try:
-            os.remove(path)
-        except Exception as e:
-            print(f"Erreur lors de la suppression de {path} : {e}")
-
-async def cleanup_file(filepath):
-    await asyncio.sleep(1)
-    try:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            print(f"Fichier supprimé : {filepath}")
-    except Exception as e:
-        print(f"Erreur lors de la suppression du fichier : {e}")
-
-def after_playing(error):
-    if error:
-        print(f"Erreur de lecture : {error}")
-    # Lance la suppression du fichier joué
-    asyncio.run_coroutine_threadsafe(cleanup_file(player.filepath), bot.loop)
 
 @bot.command()
 async def join(ctx):
     if ctx.author.voice:
         await ctx.author.voice.channel.connect()
-    else:
-        await ctx.send("Tu dois être dans un salon vocal pour que je te rejoigne.")
 
-@bot.command()
-async def play(ctx, *, url):
-    global player
-    if not ctx.voice_client:
-        if ctx.author.voice:
-            await ctx.author.voice.channel.connect()
-        else:
-            await ctx.send("Tu dois être dans un salon vocal pour jouer de la musique.")
-            return
-
-    async with ctx.typing():
-        player = await YTDLSource.from_url(url, loop=bot.loop, stream=False)
-        ctx.voice_client.play(player, after=after_playing)
-        await ctx.send(f"🎶 Lecture en cours : **{player.title}**")
-
-@bot.command()
-async def stop(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-    await cleanup_temp_folder()  # Vide tout le dossier temp
 
 @bot.command()
 async def leave(ctx):
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
-    await cleanup_temp_folder()  # Vide tout le dossier temp
+        vider_temp()
+
+
+@bot.command()
+async def play(ctx, url):
+    try:
+        async with ctx.typing():
+            player = await YTDLSource.from_url(url, loop=bot.loop, stream=False)
+
+            def after_playing(error):
+                try:
+                    if error:
+                        print(f"Erreur après lecture: {error}")
+                    if os.path.exists(player.filepath):
+                        os.remove(player.filepath)
+                except Exception as e:
+                    print(f"Erreur suppression fichier: {e}")
+
+            ctx.voice_client.play(player, after=after_playing)
+
+        await ctx.send(f'Lecture: {player.data["title"]}')
+    except Exception as e:
+        await ctx.send(f"Erreur: {e}")
+
+
+@bot.command()
+async def stop(ctx):
+    if ctx.voice_client:
+        ctx.voice_client.stop()
+        await ctx.voice_client.disconnect()
+        vider_temp()
+
+
+def vider_temp():
+    if os.path.exists("temp"):
+        for filename in os.listdir("temp"):
+            filepath = os.path.join("temp", filename)
+            try:
+                os.remove(filepath)
+            except Exception as e:
+                print(f"Erreur suppression {filepath} : {e}")
+
 
 @bot.event
-async def on_voice_state_update(member, before, after):
-    # Si c’est le bot qui est déconnecté manuellement du vocal, on vide le dossier temp
-    if member == bot.user:
-        # Déconnecté du vocal (avant avait un channel, après none)
-        if before.channel is not None and after.channel is None:
-            await cleanup_temp_folder()
+async def on_disconnect():
+    print("Bot déconnecté de Discord.")
+    vider_temp()
 
-@bot.event
-async def on_ready():
-    print(f"Bot connecté en tant que {bot.user}")
 
 bot.run(TOKEN)
